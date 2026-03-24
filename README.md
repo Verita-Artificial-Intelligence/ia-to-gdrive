@@ -59,6 +59,21 @@ On the first non-dry run, the script opens the OAuth flow and writes `token.json
 
 If `--drive-folder` is not provided, uploads go to the Drive root.
 
+## How to get `credentials.json`
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/).
+2. Create or select a project.
+3. Enable the Google Drive API for that project.
+4. Open `APIs & Services` -> `OAuth consent screen` and configure it.
+5. Open `APIs & Services` -> `Credentials`.
+6. Click `Create Credentials` -> `OAuth client ID`.
+7. Choose application type `Desktop app`.
+8. Create the client.
+9. Download the JSON file.
+10. Save it in this project as `credentials.json`.
+
+That is the file this script uses for the Google OAuth flow.
+
 ## Run
 
 Dry run:
