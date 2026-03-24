@@ -74,6 +74,20 @@ If `--drive-folder` is not provided, uploads go to the Drive root.
 
 That is the file this script uses for the Google OAuth flow.
 
+## How to find `YOUR_FOLDER_ID`
+
+1. Open the target folder in Google Drive.
+2. Look at the browser URL.
+3. Copy the part after `/folders/`.
+
+Example:
+
+```text
+https://drive.google.com/drive/folders/YOUR_FOLDER_ID
+```
+
+Use that value with `--drive-folder`.
+
 ## Run
 
 Dry run:
