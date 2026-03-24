@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Download books from Internet Archive and upload to Google Drive.
+Download books from Internet Archive to Google Drive via true diskless streaming.
 
 Usage:
     python ia_books_to_gdrive.py -i books.txt --dry-run
-    python ia_books_to_gdrive.py -i books.txt --drive-folder <FOLDER_ID>
-    python ia_books_to_gdrive.py -i books.txt --drive-folder <FOLDER_ID> --cleanup
-
-Input file format (one per line, optional "| author"):
-    Moby Dick | Herman Melville
-    The Great Gatsby
-    Meditations | Marcus Aurelius
+    python ia_books_to_gdrive.py -i books.txt --drive-folder <FOLDER_ID_OR_LINK>
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
 import os
 import re
 import sys
@@ -24,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 import internetarchive as ia
+import requests
 from rapidfuzz import fuzz
 
 # ---------------------------------------------------------------------------
@@ -45,7 +41,7 @@ REPORT_COLUMNS = [
     "match_score",
     "runner_up_score",
     "ia_identifier",
-    "local_file",
+    "ia_direct_url",
     "status",
     "drive_file_id",
 ]
@@ -66,8 +62,19 @@ class BookQuery:
 # ---------------------------------------------------------------------------
 
 
+def extract_folder_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"id=([a-zA-Z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    return value.split("?")[0].strip()
+
+
 def parse_input(filepath: str) -> list[BookQuery]:
-    """Parse a TXT file into BookQuery objects. Skips blanks, # comments, and empty titles."""
     queries: list[BookQuery] = []
     try:
         with open(filepath, "r", encoding="utf-8-sig") as f:
@@ -96,7 +103,6 @@ def parse_input(filepath: str) -> list[BookQuery]:
 
 
 def normalize(text: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace."""
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -110,10 +116,6 @@ def normalize(text: str) -> str:
 def search_ia(
     query: BookQuery, max_results: int = IA_MAX_RESULTS
 ) -> tuple[list[dict], bool]:
-    """
-    Search IA with broad keyword query, return (candidate list, success bool).
-    Returns ([], False) on API failure vs ([], True) for genuinely no results.
-    """
     title_terms = query.title
     if query.author:
         q = f"({title_terms}) AND creator:({query.author}) AND mediatype:(texts)"
@@ -153,15 +155,11 @@ def search_ia(
 
 
 # ---------------------------------------------------------------------------
-# Fuzzy matching / candidate ranking
+# Fuzzy matching
 # ---------------------------------------------------------------------------
 
 
 def score_candidate(query: BookQuery, candidate: dict) -> float:
-    """
-    Score a single IA result against the user's query.
-    Title similarity is primary (0-100). Author match adds up to 15 bonus.
-    """
     title_score = fuzz.token_set_ratio(
         normalize(query.title),
         normalize(candidate.get("title", "")),
@@ -186,7 +184,6 @@ def find_best_match(
     ia_results: list[dict],
     threshold: float = DEFAULT_THRESHOLD,
 ) -> dict | None:
-    """Rank all candidates by score, return best if above threshold."""
     if not ia_results:
         return None
 
@@ -200,7 +197,6 @@ def find_best_match(
     if not scored:
         return None
 
-    # Primary: highest score. Tiebreaker: most downloads.
     def _sort_key(item: tuple[float, dict]) -> tuple[float, float]:
         score, cand = item
         dl = cand.get("downloads", 0)
@@ -232,33 +228,139 @@ def find_best_match(
 
 
 # ---------------------------------------------------------------------------
-# Internet Archive download
+# Streaming pipeline (zero disk, minimal RAM)
 # ---------------------------------------------------------------------------
 
 
-def download_book(
+class IARangeStream(io.RawIOBase):
+    """
+    A seekable wrapper around an HTTP stream that allows googleapiclient
+    to do resumable chunk uploads without fetching the full file to RAM or disk.
+    """
+
+    # Shared across all streams so IA rate-limit cookies propagate globally.
+    _session = None
+
+    @classmethod
+    def _get_session(cls) -> requests.Session:
+        if cls._session is None:
+            cls._session = requests.Session()
+            cls._session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            })
+        return cls._session
+
+    def __init__(self, vanity_url: str, fallback_size: int):
+        self.url = vanity_url
+        self.position = 0
+        self.size = fallback_size
+        self.response = None
+        self.session = self._get_session()
+
+        # Determine exact remote file size using HEAD to avoid 416 range errors
+        # if the IA metadata size deviates from the physical file length.
+        # Using the shared session ensures any auth cookies from the redirect
+        # chain are stored and reused for subsequent GET requests.
+        try:
+            head_resp = self.session.head(self.url, allow_redirects=True, timeout=15)
+            if head_resp.status_code == 200 and "Content-Length" in head_resp.headers:
+                self.size = int(head_resp.headers["Content-Length"])
+        except Exception:
+            pass
+
+    def _connect(self):
+        if self.response:
+            self.response.close()
+
+        headers = {}
+        # Only send Range header if we are not at 0, skipping the problematic 'bytes=0-'
+        if self.position > 0:
+            headers = {"Range": f"bytes={self.position}-"}
+
+        # Use the shared session so cookies from HEAD redirects are included.
+        self.response = self.session.get(
+            self.url, headers=headers, stream=True, timeout=(10, 60)
+        )
+        self.response.raise_for_status()
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            new_pos = offset
+        elif whence == io.SEEK_CUR:
+            new_pos = self.position + offset
+        elif whence == io.SEEK_END:
+            new_pos = self.size + offset
+
+        # Clamp explicitly
+        new_pos = max(0, min(new_pos, self.size))
+
+        if new_pos != self.position:
+            self.position = new_pos
+            if self.response:
+                self.response.close()
+                self.response = None
+
+        return self.position
+
+    def tell(self) -> int:
+        return self.position
+
+    def read(self, size: int = -1) -> bytes:
+        if self.position >= self.size:
+            return b""
+            
+        if self.response is None:
+            self._connect()
+
+        chunk = self.response.raw.read(size)
+        self.position += len(chunk)
+        return chunk
+
+    def readinto(self, b: bytearray) -> int:
+        chunk = self.read(len(b))
+        ret = len(chunk)
+        b[:ret] = chunk
+        return ret
+        
+    def close(self):
+        if self.response:
+            self.response.close()
+        super().close()
+
+
+def stream_book_to_gdrive(
+    service,
     identifier: str,
-    output_dir: str,
+    folder_id: str | None = None,
     formats: tuple[str, ...] = FORMAT_PRIORITY,
     max_retries: int = MAX_RETRIES,
-) -> tuple[str | None, str]:
+    progress_callback=None,
+    status_callback=None,
+) -> tuple[dict | None, str, str, str]:
     """
-    Download the best available file from an IA item.
-    Returns (file_path, status) where status is one of:
-      "ok"                  — downloaded and verified
-      "no_downloadable_file" — item has no file in preferred formats
-      "download_failed"     — network/IO error after retries
+    Identifies the target IA file and streams it directly to Google Drive.
+    Returns (drive_metadata, direct_url, status, error_detail)
     """
-    os.makedirs(output_dir, exist_ok=True)
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseUpload
 
     try:
         item = ia.get_item(identifier)
         all_files = list(item.get_files())
     except Exception as e:
-        print(f"  Warning: Could not fetch item {identifier}: {e}")
-        return None, "download_failed"
+        msg = f"Could not fetch item {identifier}: {e}"
+        print(f"  Warning: {msg}")
+        if status_callback:
+            status_callback(msg)
+        return None, "", "download_failed", msg
 
-    # Find first file matching preferred format by exact label
     target = None
     for fmt in formats:
         for f in all_files:
@@ -269,64 +371,104 @@ def download_book(
             break
 
     if target is None:
-        return None, "no_downloadable_file"
+        msg = f"No file in formats {formats} found for item '{identifier}'"
+        if status_callback:
+            status_callback(msg)
+        return None, "", "no_downloadable_file", msg
 
-    # internetarchive downloads to: output_dir/identifier/filename
-    expected_path = os.path.join(output_dir, identifier, target.name)
+    try:
+        meta_size = int(target.size)
+    except (TypeError, ValueError):
+        meta_size = 0
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            target.download(destdir=output_dir)
-            time.sleep(IA_THROTTLE_SECONDS)
+    direct_url = f"https://archive.org/download/{identifier}/{target.name}"
+    
+    file_metadata: dict = {"name": target.name}
+    if folder_id:
+        file_metadata["parents"] = [folder_id]
 
-            # Verify file actually landed
-            if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
-                return expected_path, "ok"
+    mime_map = {".pdf": "application/pdf", ".epub": "application/epub+zip"}
+    ext = os.path.splitext(target.name)[1].lower()
+    mime_type = mime_map.get(ext, "application/octet-stream")
 
-            # File didn't land where expected — check alternative path
-            alt_path = os.path.join(output_dir, target.name)
-            if os.path.exists(alt_path) and os.path.getsize(alt_path) > 0:
-                return alt_path, "ok"
+    print(f"  Streaming: {target.name} ({meta_size // 1024}KB) via dynamic RangeStream...")
 
-            # File missing/empty — retry
-            if attempt < max_retries:
-                wait = 2**attempt
-                print(f"  Download produced empty/missing file, retrying in {wait}s")
-                time.sleep(wait)
-                continue
-            print("  Download produced empty/missing file after all attempts")
-            return None, "download_failed"
-        except Exception as e:
-            if attempt == max_retries:
-                print(f"  Download failed after {max_retries} attempts: {e}")
-                return None, "download_failed"
-            wait = 2**attempt
-            print(f"  Download attempt {attempt} failed, retrying in {wait}s: {e}")
-            time.sleep(wait)
+    stream = IARangeStream(direct_url, meta_size)
+    try:
+        media = MediaIoBaseUpload(
+            stream, mimetype=mime_type, chunksize=5 * 1024 * 1024, resumable=True
+        )
 
-    return None, "download_failed"
+        for attempt in range(1, max_retries + 1):
+            try:
+                request = service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id, name",
+                    supportsAllDrives=True,
+                )
+                response = None
+                while response is None:
+                    status_obj, response = request.next_chunk()
+                    if status_obj:
+                        progress = int(status_obj.progress() * 100)
+                        if progress_callback:
+                            progress_callback(progress)
+                        elif progress % 20 == 0:
+                            print(f"    - Uploaded {progress}%")
+                return response, direct_url, "success", ""
+                
+            except HttpError as e:
+                status_code = e.resp.status if hasattr(e, "resp") else 0
+                err_msg = f"Google API error {status_code}: {e}"
+                if status_code in (429, 500, 502, 503) and attempt < max_retries:
+                    wait = 2**attempt
+                    print(f"  Upload attempt {attempt} failed ({status_code}), retrying in {wait}s")
+                    if status_callback:
+                        status_callback(f"Attempt {attempt} failed ({status_code}), retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"  Upload failed (HttpError): {e}")
+                    if status_callback:
+                        status_callback(err_msg)
+                    return None, direct_url, "upload_failed", err_msg
+            except Exception as e:
+                err_msg = str(e)
+                if attempt < max_retries:
+                    wait = 2**attempt
+                    print(f"  Upload attempt {attempt} interrupted: {e}, retrying in {wait}s")
+                    if status_callback:
+                        status_callback(f"Attempt {attempt}: {err_msg}, retrying in {wait}s...")
+                    time.sleep(wait)
+                    # Re-open the stream for the next attempt
+                    stream.seek(0)
+                else:
+                    print(f"  Upload failed (Exception): {e}")
+                    if status_callback:
+                        status_callback(f"Upload failed after {max_retries} attempts: {err_msg}")
+                    return None, direct_url, "upload_failed", err_msg
+    finally:
+        stream.close()
+
+    return None, direct_url, "upload_failed", "Exhausted retries"
 
 
 # ---------------------------------------------------------------------------
-# Google Drive auth + upload
+# Google Drive auth
 # ---------------------------------------------------------------------------
 
-# drive scope (not drive.file) needed to upload into arbitrary existing folders
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-
 
 def get_drive_service(
     credentials_path: str = "credentials.json",
     token_path: str = "token.json",
 ):
-    """Build and return an authenticated Drive API v3 service."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
     creds = None
-
     if os.path.exists(token_path):
         try:
             creds = Credentials.from_authorized_user_file(token_path, SCOPES)
@@ -352,58 +494,6 @@ def get_drive_service(
     return build("drive", "v3", credentials=creds)
 
 
-def upload_to_drive(
-    service,
-    file_path: str,
-    folder_id: str | None = None,
-    max_retries: int = MAX_RETRIES,
-) -> dict | None:
-    """
-    Upload a file to Google Drive. Returns file metadata dict on success.
-    The file is private to the uploader — no shareable link is created.
-    """
-    from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaFileUpload
-
-    file_metadata: dict = {"name": os.path.basename(file_path)}
-    if folder_id:
-        file_metadata["parents"] = [folder_id]
-
-    mime_map = {".pdf": "application/pdf", ".epub": "application/epub+zip"}
-    ext = os.path.splitext(file_path)[1].lower()
-    mime_type = mime_map.get(ext, "application/octet-stream")
-
-    media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            result = (
-                service.files()
-                .create(
-                    body=file_metadata,
-                    media_body=media,
-                    fields="id, name",
-                    supportsAllDrives=True,
-                )
-                .execute()
-            )
-            return result
-        except HttpError as e:
-            status = e.resp.status if hasattr(e, "resp") else 0
-            if status in (429, 500, 502, 503) and attempt < max_retries:
-                wait = 2**attempt
-                print(f"  Upload attempt {attempt} failed ({status}), retrying in {wait}s")
-                time.sleep(wait)
-            else:
-                print(f"  Upload failed: {e}")
-                return None
-        except Exception as e:
-            print(f"  Upload failed: {e}")
-            return None
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Preflight validation
 # ---------------------------------------------------------------------------
@@ -416,7 +506,6 @@ def preflight(
     folder_id: str | None,
     dry_run: bool,
 ):
-    """Validate config before processing. Returns Drive service or None for dry-run."""
     os.makedirs(output_dir, exist_ok=True)
 
     if dry_run:
@@ -457,7 +546,6 @@ def preflight(
 
 
 def _sanitize_csv(value: str) -> str:
-    """Prevent CSV formula injection by prefixing dangerous leading chars."""
     if value and value[0] in ("=", "+", "-", "@"):
         return "'" + value
     return value
@@ -468,7 +556,7 @@ def make_row(
     match: dict | None = None,
     status: str = "",
     drive_id: str = "",
-    file_path: str = "",
+    direct_url: str = "",
 ) -> dict:
     creator = ""
     if match:
@@ -484,7 +572,7 @@ def make_row(
         "match_score": match["score"] if match else "",
         "runner_up_score": match.get("runner_up_score", "") if match else "",
         "ia_identifier": match["identifier"] if match else "",
-        "local_file": file_path,
+        "ia_direct_url": direct_url,
         "status": status,
         "drive_file_id": drive_id,
     }
@@ -512,19 +600,16 @@ def run(
     folder_id: str | None,
     threshold: float,
     dry_run: bool,
-    cleanup: bool,
 ) -> None:
-    # 0. Preflight
     service = preflight(credentials_path, token_path, output_dir, folder_id, dry_run)
 
-    # 1. Parse input
     queries = parse_input(input_file)
     if not queries:
         print("No book titles found in input file.")
         write_report([], output_dir)
         return
 
-    mode = "DRY RUN — search & match only" if dry_run else "full pipeline"
+    mode = "DRY RUN — search & match only" if dry_run else "full pipeline (diskless stream)"
     print(f"Processing {len(queries)} book(s) [{mode}]\n")
 
     results: list[dict] = []
@@ -535,7 +620,6 @@ def run(
             label += f" by {query.author}"
         print(label)
 
-        # 2. Search
         ia_results, search_ok = search_ia(query)
         if not search_ok:
             print("  ✗ Search failed (API error)")
@@ -546,7 +630,6 @@ def run(
             results.append(make_row(query, status="no_results"))
             continue
 
-        # 3. Match
         match = find_best_match(query, ia_results, threshold=threshold)
         if not match:
             print(f"  ✗ No match above threshold ({threshold})")
@@ -562,28 +645,15 @@ def run(
             results.append(make_row(query, match=match, status="dry_run"))
             continue
 
-        # 4. Download
-        file_path, dl_status = download_book(match["identifier"], output_dir)
-        if file_path is None:
-            msg = (
-                "No downloadable PDF/EPUB found"
-                if dl_status == "no_downloadable_file"
-                else "Download failed (network/IO error)"
-            )
-            print(f"  ✗ {msg}")
-            results.append(make_row(query, match=match, status=dl_status))
-            continue
+        drive_file, direct_url, dl_status, err_detail = stream_book_to_gdrive(
+            service, match["identifier"], folder_id
+        )
 
-        file_size = os.path.getsize(file_path)
-        print(f"  Downloaded: {os.path.basename(file_path)} ({file_size // 1024}KB)")
-
-        # 5. Upload
-        drive_file = upload_to_drive(service, file_path, folder_id)
         if not drive_file:
-            print("  ✗ Upload to Drive failed (local file kept for retry)")
+            print("  ✗ Streaming upload failed")
             results.append(
                 make_row(
-                    query, match=match, status="upload_failed", file_path=file_path
+                    query, match=match, status=dl_status, direct_url=direct_url
                 )
             )
             continue
@@ -595,26 +665,16 @@ def run(
                 match=match,
                 status="success",
                 drive_id=drive_file["id"],
-                file_path=file_path,
+                direct_url=direct_url, # Now accurately pointing to correct URL!
             )
         )
 
-        if cleanup:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    print("  Cleaned up local file")
-            except OSError as e:
-                print(f"  Warning: Could not clean up {file_path}: {e}")
-
-    # 6. Report
     try:
         report_path = write_report(results, output_dir)
     except OSError as e:
         print(f"\nError: Could not write report: {e}")
         report_path = "(failed to write)"
 
-    # Summary
     print("\n" + "=" * 60)
     success = sum(1 for r in results if r["status"] == "success")
     matched = sum(1 for r in results if r["status"] in ("success", "dry_run"))
@@ -630,14 +690,8 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download books from Internet Archive and upload to Google Drive.",
+        description="Download books from Internet Archive to Google Drive natively.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            'Input file format (one per line, optional "| author"):\n'
-            "  Moby Dick | Herman Melville\n"
-            "  The Great Gatsby\n"
-            "  Meditations | Marcus Aurelius\n"
-        ),
     )
     parser.add_argument(
         "-i",
@@ -648,38 +702,33 @@ def main() -> None:
     parser.add_argument(
         "--drive-folder",
         default=None,
-        help="Google Drive folder ID to upload into (default: Drive root)",
+        help="Google Drive folder ID or full link to upload into",
     )
     parser.add_argument(
         "--credentials",
         default="credentials.json",
-        help="Path to Google OAuth credentials.json (default: ./credentials.json)",
+        help="Path to Google OAuth credentials.json",
     )
     parser.add_argument(
         "--token",
         default="token.json",
-        help="Path to store OAuth token (default: ./token.json)",
+        help="Path to store OAuth token",
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=DEFAULT_THRESHOLD,
-        help=f"Fuzzy match score threshold 0-100 (default: {DEFAULT_THRESHOLD})",
+        help=f"Fuzzy match score threshold 0-100",
     )
     parser.add_argument(
         "--output-dir",
         default="./downloads",
-        help="Local directory for downloads + report (default: ./downloads)",
+        help="Local directory for strictly resolving report.csv",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Search and match only — don't download or upload",
-    )
-    parser.add_argument(
-        "--cleanup",
-        action="store_true",
-        help="Delete local files after successful upload",
     )
 
     args = parser.parse_args()
@@ -687,15 +736,16 @@ def main() -> None:
     if not os.path.isfile(args.input):
         sys.exit(f"Error: Input file not found or is not a file: {args.input}")
 
+    folder_id = extract_folder_id(args.drive_folder)
+
     run(
         input_file=args.input,
         output_dir=args.output_dir,
         credentials_path=args.credentials,
         token_path=args.token,
-        folder_id=args.drive_folder,
+        folder_id=folder_id,
         threshold=args.threshold,
         dry_run=args.dry_run,
-        cleanup=args.cleanup,
     )
 
 
