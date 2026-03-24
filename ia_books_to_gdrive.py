@@ -244,31 +244,45 @@ class IARangeStream(io.RawIOBase):
     @classmethod
     def _get_session(cls) -> requests.Session:
         if cls._session is None:
-            cls._session = requests.Session()
-            cls._session.headers.update({
+            s = requests.Session()
+            s.headers.update({
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
+                "Accept-Encoding": "identity",   # avoid gzip; we want raw bytes
+                "Connection": "keep-alive",
             })
+            # Enable TCP keep-alive and larger connection pool
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=4,
+                pool_maxsize=4,
+                max_retries=0,
+            )
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            cls._session = s
         return cls._session
 
     def __init__(self, vanity_url: str, fallback_size: int):
         self.url = vanity_url
+        self._cdn_url: str | None = None  # resolved CDN URL (skip redirects on GET)
         self.position = 0
         self.size = fallback_size
         self.response = None
         self.session = self._get_session()
 
-        # Determine exact remote file size using HEAD to avoid 416 range errors
-        # if the IA metadata size deviates from the physical file length.
-        # Using the shared session ensures any auth cookies from the redirect
-        # chain are stored and reused for subsequent GET requests.
+        # Determine exact remote file size using HEAD to avoid 416 range errors.
+        # Also capture the resolved CDN URL to skip redirects on every GET.
         try:
             head_resp = self.session.head(self.url, allow_redirects=True, timeout=15)
-            if head_resp.status_code == 200 and "Content-Length" in head_resp.headers:
-                self.size = int(head_resp.headers["Content-Length"])
+            if head_resp.status_code == 200:
+                # Cache the final CDN URL (e.g. https://ia903204.us.archive.org/...)
+                if head_resp.url != self.url:
+                    self._cdn_url = head_resp.url
+                if "Content-Length" in head_resp.headers:
+                    self.size = int(head_resp.headers["Content-Length"])
         except Exception:
             pass
 
@@ -277,13 +291,13 @@ class IARangeStream(io.RawIOBase):
             self.response.close()
 
         headers = {}
-        # Only send Range header if we are not at 0, skipping the problematic 'bytes=0-'
         if self.position > 0:
             headers = {"Range": f"bytes={self.position}-"}
 
-        # Use the shared session so cookies from HEAD redirects are included.
+        # Use the CDN URL directly (skip the 302 redirect) if available
+        url = self._cdn_url or self.url
         self.response = self.session.get(
-            self.url, headers=headers, stream=True, timeout=(10, 60)
+            url, headers=headers, stream=True, timeout=(10, 60)
         )
         self.response.raise_for_status()
 
@@ -297,6 +311,8 @@ class IARangeStream(io.RawIOBase):
             new_pos = self.position + offset
         elif whence == io.SEEK_END:
             new_pos = self.size + offset
+        else:
+            raise ValueError(f"Unsupported whence value: {whence}")
 
         # Clamp explicitly
         new_pos = max(0, min(new_pos, self.size))
@@ -320,6 +336,12 @@ class IARangeStream(io.RawIOBase):
             self._connect()
 
         chunk = self.response.raw.read(size)
+        # If socket returned empty but we haven't reached EOF, reconnect
+        if not chunk and self.position < self.size:
+            self.response.close()
+            self.response = None
+            self._connect()
+            chunk = self.response.raw.read(size)
         self.position += len(chunk)
         return chunk
 
@@ -395,8 +417,17 @@ def stream_book_to_gdrive(
 
     stream = IARangeStream(direct_url, meta_size)
     try:
+        # Adaptive chunk size: for files ≤ 50MB, upload in one shot (1 HTTP
+        # round-trip). For larger files, use 25MB chunks (5× fewer RTTs than
+        # the old 5MB default).
+        file_size = stream.size
+        if file_size <= 50 * 1024 * 1024:
+            chunk_size = max(file_size, 256 * 1024)  # at least 256KB
+        else:
+            chunk_size = 25 * 1024 * 1024
+
         media = MediaIoBaseUpload(
-            stream, mimetype=mime_type, chunksize=5 * 1024 * 1024, resumable=True
+            stream, mimetype=mime_type, chunksize=chunk_size, resumable=True
         )
 
         for attempt in range(1, max_retries + 1):
@@ -440,8 +471,12 @@ def stream_book_to_gdrive(
                     if status_callback:
                         status_callback(f"Attempt {attempt}: {err_msg}, retrying in {wait}s...")
                     time.sleep(wait)
-                    # Re-open the stream for the next attempt
+                    # Re-open the stream and recreate the media object so
+                    # Google API's internal position tracker is reset.
                     stream.seek(0)
+                    media = MediaIoBaseUpload(
+                        stream, mimetype=mime_type, chunksize=chunk_size, resumable=True
+                    )
                 else:
                     print(f"  Upload failed (Exception): {e}")
                     if status_callback:

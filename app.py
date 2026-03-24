@@ -1,7 +1,9 @@
 import streamlit as st
 import os
 import json
+import time
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import Flow
 
@@ -15,6 +17,48 @@ from ia_books_to_gdrive import (
     DEFAULT_THRESHOLD,
 )
 
+
+def _inject_custom_css():
+    """Inject custom CSS to turn primary buttons green."""
+    st.markdown("""
+        <style>
+        /* Primary button styling: both st.button and st.form_submit_button */
+        button[kind="primary"] {
+            background-color: #28a745 !important;
+            color: white !important;
+            border-color: #28a745 !important;
+        }
+        button[kind="primary"]:hover {
+            background-color: #218838 !important;
+            color: white !important;
+            border-color: #1e7e34 !important;
+        }
+        button[kind="primary"]:active {
+            background-color: #1e7e34 !important;
+            color: white !important;
+        }
+
+        /* Link button as primary: targets the <a> tag inside stLinkButton */
+        [data-testid="stLinkButton"] a[kind="primary"] {
+            background-color: #28a745 !important;
+            color: white !important;
+            border-color: #28a745 !important;
+            text-decoration: none !important;
+        }
+        [data-testid="stLinkButton"] a[kind="primary"]:hover {
+            background-color: #218838 !important;
+            color: white !important;
+            border-color: #1e7e34 !important;
+            text-decoration: none !important;
+        }
+        [data-testid="stLinkButton"] a[kind="primary"]:active {
+            background-color: #1e7e34 !important;
+            color: white !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CLIENT_SECRETS_FILE = "credentials.json"
 
@@ -25,10 +69,31 @@ CLIENT_SECRETS_FILE = "credentials.json"
 # navigation). Instead, we use a server-process-global dict keyed by the
 # OAuth `state` parameter, which Google always echoes back in the redirect
 # URL. This dict lives as long as the Streamlit server process.
+_VERIFIER_TTL_SECONDS = 600  # 10 minutes
+
 @st.cache_resource
 def _get_verifier_store() -> dict:
-    """Process-global store: {oauth_state: code_verifier}."""
+    """Process-global store: {oauth_state: (code_verifier, timestamp)}."""
     return {}
+
+
+def _store_verifier(store: dict, state: str, verifier: str):
+    """Store a verifier with a timestamp, evicting stale entries."""
+    now = time.time()
+    # Evict entries older than TTL to prevent unbounded growth
+    stale_keys = [k for k, (_, ts) in store.items() if now - ts > _VERIFIER_TTL_SECONDS]
+    for k in stale_keys:
+        del store[k]
+    store[state] = (verifier, now)
+
+
+def _pop_verifier(store: dict, state: str) -> str | None:
+    """Retrieve and remove a verifier by state key."""
+    entry = store.pop(state, None)
+    if entry is None:
+        return None
+    verifier, _ = entry
+    return verifier
 
 
 def init_oauth_flow():
@@ -42,16 +107,26 @@ def init_oauth_flow():
 
     redirect_uri = os.environ.get("REDIRECT_URI", redirect_uri)
 
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri=redirect_uri,
-    )
+    if "gcp_oauth" in st.secrets:
+        # Convert streamlit secrets AttrDict to a standard dict
+        client_config = dict(st.secrets["gcp_oauth"])
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri,
+        )
+    else:
+        flow = Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri,
+        )
     return flow
 
 
 def main():
     st.set_page_config(page_title="IA to Google Drive", page_icon="📚", layout="centered")
+    _inject_custom_css()
 
     st.title("📚 Internet Archive to Google Drive Streamer")
     st.markdown("Seamlessly transfer books from Internet Archive directly to your Google Drive via zero-disk streaming.")
@@ -71,7 +146,7 @@ def main():
 
             # Restore the PKCE code_verifier from our process-global store.
             # The key is the `state` param that Google echoed back.
-            code_verifier = verifier_store.pop(oauth_state, None)
+            code_verifier = _pop_verifier(verifier_store, oauth_state)
 
             # Pass code_verifier explicitly so it is included in the token
             # exchange request body, satisfying Google's PKCE validation.
@@ -88,9 +163,13 @@ def main():
     if not st.session_state.credentials:
         st.info("👋 Welcome! To upload books directly to your Google Drive, please authenticate first.")
 
-        if not os.path.exists(CLIENT_SECRETS_FILE):
-            st.error(f"🚨 Missing `{CLIENT_SECRETS_FILE}` in the working directory.")
-            st.markdown("Please generate an OAuth 2.0 Client ID of type **Web application** from the [Google Cloud Console](https://console.cloud.google.com/), download it, name it `credentials.json`, and place it in the project root.")
+        has_secrets = "gcp_oauth" in st.secrets
+        if not has_secrets and not os.path.exists(CLIENT_SECRETS_FILE):
+            st.error(f"🚨 Missing OAuth credentials.")
+            st.markdown(
+                "**Local Development:** Place `credentials.json` in the project root.\n\n"
+                "**Streamlit Cloud:** Add the contents of your `credentials.json` to the app's Secrets under a `[gcp_oauth]` heading."
+            )
             return
 
         try:
@@ -100,7 +179,7 @@ def main():
             # Persist the PKCE code_verifier in our process-global store,
             # keyed by `state` which Google will echo back after consent.
             if hasattr(flow, "code_verifier") and flow.code_verifier:
-                verifier_store[state] = flow.code_verifier
+                _store_verifier(verifier_store, state, flow.code_verifier)
 
             st.link_button("🔑 Login with Google", auth_url, type="primary")
         except ValueError as e:
@@ -109,8 +188,24 @@ def main():
             st.error(f"Error configuring OAuth: {e}")
         return
 
-    # Load active credentials
-    creds = Credentials.from_authorized_user_info(json.loads(st.session_state.credentials))
+    # Load active credentials with automatic refresh for long sessions.
+    creds = Credentials.from_authorized_user_info(
+        json.loads(st.session_state.credentials), scopes=SCOPES
+    )
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            # Persist the refreshed token so future reruns use it
+            st.session_state.credentials = creds.to_json()
+        except Exception:
+            st.warning("⚠️ Session expired. Please log in again.")
+            st.session_state.credentials = None
+            st.rerun()
+    elif not creds.valid and not creds.refresh_token:
+        st.warning("⚠️ Session expired and no refresh token available. Please log in again.")
+        st.session_state.credentials = None
+        st.rerun()
+
     service = build("drive", "v3", credentials=creds)
 
     # 3. Sidebar Configuration
@@ -209,20 +304,22 @@ def main():
                 # Cap score at 100 since author_bonus can push it to 115 theoretically
                 display_score = min(100.0, match['score'])
                 ia_url = f"https://archive.org/details/{match['identifier']}"
-                st.write(f"✅ Matched: **{match['title']}** [{ia_url}]({ia_url}) (Score: {display_score} Out of 100)")
+                st.write(f"✅ Matched: **{match['title']}** [{ia_url}]({ia_url}) Score: {display_score}")
                 
                 # 3. Stream
                 st.write("☁️ Streaming upload to Google Drive...")
                 chunk_progress = st.progress(0)
                 
-                def update_progress(p):
-                    chunk_progress.progress(p / 100.0)
+                # Use default-arg binding to freeze the widget reference
+                # for this iteration, preventing late-binding closure bugs.
+                def update_progress(p, _bar=chunk_progress):
+                    _bar.progress(p / 100.0)
                 
                 # Create a status log container for live error messages
                 status_log = st.empty()
                 
-                def log_status(msg):
-                    status_log.warning(f"⚠️ {msg}")
+                def log_status(msg, _slot=status_log):
+                    _slot.warning(f"⚠️ {msg}")
                 
                 drive_file, direct_url, dl_status, err_detail = stream_book_to_gdrive(
                     service, 
@@ -253,6 +350,10 @@ def main():
                 
             # Update overall progress
             progress_bar.progress((i + 1) / len(queries))
+
+            # Brief pause between books to avoid Google API rate limiting
+            if i + 1 < len(queries):
+                time.sleep(0.5)
             
         st.balloons()
         st.success("All tasks completed!")
